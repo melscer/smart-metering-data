@@ -1,0 +1,367 @@
+---
+title: "Occupancy detection from smart meter data"
+author: "Melania Scerra"
+date: "2/29/2020"
+output:
+  pdf_document: default
+  
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## Introduction
+
+The ECO data set is available [here](http://rossa-prod-ap21.ethz.ch/delivery/DeliveryManagerServlet?dps_pid=IE594964). The README file reads as follows:
+_The ECO (Electricity Consumption and Occupancy) data set is a comprehensive open-source (Creative Commons License CC BY 4.0) data set for non-intrusive load monitoring and occupancy detection research. It was collected in 6 Swiss households over a period of 8 months. For each of the households, the ECO data set provides:
+
++ 1 Hz aggregate consumption data. Each measurement contains data on current, voltage, and phase shift for each of the three phases in the household.
++ 1 Hz plug-level data measured from selected appliances.
++ Occupancy information measured through a tablet computer (manual labeling) and a passive infrared sensor (in some of the households)._  
+
+In this analysis, I am going to focus on Household 1. The goal is to construct an occupancy detection classifier from aggregate consumption data. The analysis has been inspired by the paper by [Kleiminger et al. (2013)](https://www.vs.inf.ethz.ch/publ/papers/wilhelmk-occupa-20131.pdf).
+
+```{r message=FALSE, warning=FALSE}
+
+library(dplyr)
+library(tidyr)
+library(lubridate) 
+library(stringr)   # str_replace
+library(data.table) # fread
+library(zoo)       # rollapply 
+library(mosaic)    # SAD 
+library(caret)     # createDataPartition
+library(class)     # knn
+```
+
+
+## Importing the dataset
+
+Importing the occupancy data sets (divided into summer and winter seasons):
+```{r message=FALSE, warning=FALSE}
+setwd("~/Leuphana/Learning from Data/SmartMeters/01")
+h1summer <- fread("summer.csv", header = TRUE)
+h1winter <- fread("winter.csv", header = TRUE)
+h1summer <- as.data.frame(h1summer)
+h1winter <- as.data.frame(h1winter)
+```
+
+The resulting data frames have seconds as columns and days as rows.
+Importing the power dataset:
+```{r message=FALSE, warning=FALSE, results='hide'}
+setwd("~/Leuphana/Learning from Data/SmartMeters/01/sm")
+files <- list.files()
+h1p1 <- lapply(files, function(i){
+  fread(i, select = 2)
+})
+h1p1 <- as.data.frame(h1p1)
+```
+
+The following convention for naming the power datasets is used: h1p1 corresponds to the phase 1 power consumption for household 1, h1p2 to phase 2 power consumption, and h1p3 to phase 3 power consumption. At this point, the data set is stored in a data frames, where each row corresponds to a second, and each column to a day. The power is measured in Watts. Finally, I am going to rename the columns by assigning to each their respective day. I am also going to add a column for the seconds.
+
+```{r message=FALSE, warning=FALSE, results = 'hide'}
+h1Dates <- ymd(files)
+colnames(h1p1) <-h1Dates
+h1p1$seconds <- hms(colnames(h1winter[2:86401]))
+```
+
+Repeating everything for phase 2 and phase 3 power consumption:
+```{r message=FALSE, warning=FALSE, results = 'hide'}
+setwd("~/Leuphana/Learning from Data/SmartMeters/01/sm")
+h1p2 <- lapply(files, function(i){
+  fread(i, select = 3)
+})
+h1p2 <- as.data.frame(h1p2)
+h2Dates <- ymd(files)
+colnames(h1p2) <-h1Dates
+h1p2$seconds <- hms(colnames(h1winter[2:86401]))
+
+h1p3 <- lapply(files, function(i){
+  fread(i, select = 4)
+})
+h1p3 <- as.data.frame(h1p3)
+h3Dates <- ymd(files)
+colnames(h1p3) <-h1Dates
+h1p3$seconds <- hms(colnames(h1winter[2:86401]))
+```
+
+## Data cleaning
+### Selecting days of interest
+Merging the summer and winter occupancy data sets:
+```{r message=FALSE, warning=FALSE, results = 'hide'}
+h1occ <- rbind(h1summer, h1winter)
+```
+
+In the occupancy data frame, each day is represented by a row, while in the power data frames, each day is represented by a column. I am going to convert the date strings in the occupancy datasets to date objects, and convert them into a format that matches the column names of the power data frames.
+```{r message=FALSE, warning=FALSE, results = 'hide'}
+h1occ[,1] <- as.Date(h1occ[,1], format="%d-%b-%Y")
+```
+
+Now the two formats should match:
+```{r message=FALSE, warning=FALSE, results='markup'}
+h1occ[1,1]
+colnames(h1p1)[1]
+```
+
+The power data frames contain more days than the occupancy dataset.
+Therefore, I am going subset the power data frames, selecting only the days where occupancy information is available:
+```{r message=FALSE, warning=FALSE, results='hide'}
+h1DaysToKeep <- as.character(h1occ[,1])
+h1p1Subset <- h1p1[,h1DaysToKeep]
+h1p2Subset <- h1p2[,h1DaysToKeep]
+h1p3Subset <- h1p3[,h1DaysToKeep]
+```
+
+### Selecting time frame of interest
+Now I am going to assume that householders are active only from 6 am to 10 pm. The model cannot distinguish between inactivity or low activity and absence anyway, so I am going to focus on the daytime entries in all my data frames. Note that the power datasets have an extra row compared to the number of columns in the occupancy data set. Hence I am going to subtract 1 from idx1 and idx2.
+```{r message=FALSE, warning=FALSE, results='hide'}
+idx1 <- which(colnames(h1occ) == "'06:00:00'")
+idx2 <- which(colnames(h1occ) == "'22:00:00'")
+h1occDay <- h1occ[, idx1:idx2]
+h1occDay$day <- h1occ[,1]
+h1p1Day <- h1p1Subset[(idx1-1):(idx2-1), ]
+h1p2Day <- h1p2Subset[(idx1-1):(idx2-1), ]
+h1p3Day <- h1p3Subset[(idx1-1):(idx2-1), ]
+```
+
+Finally, I am going to swap columns and rows in the occupancy datasets:
+```{r message=FALSE, warning=FALSE, results='hide'}
+rownames(h1occDay)<-h1occDay$day
+h1occDay_tr <- data.frame(t(h1occDay[-57602]), stringsAsFactors = FALSE)
+```
+
+Adjusting the format in the date format to match the one of the power data frames:
+```{r message=FALSE, warning=FALSE, results='hide'}
+colnames(h1occDay_tr) <- str_replace(colnames(h1occDay_tr), "X", "")
+colnames(h1occDay_tr) <- str_replace(colnames(h1occDay_tr), "[.]", "-")
+colnames(h1occDay_tr) <- str_replace(colnames(h1occDay_tr), "[.]", "-")
+```
+
+### Converting -1 to NA
+
+Missing values in the power dataset are indicated with -1. I am going to convert these to NA's:
+```{r message=FALSE, warning=FALSE, results='markdown'}
+any(h1p1Day==-1)
+h1p1Day[h1p1Day== -1] <- NA
+anyNA(h1p1Day)
+h1p2Day[h1p2Day== -1] <- NA
+h1p3Day[h1p3Day== -1] <- NA
+```
+I am going to remove the NA's later, once I have a long dataset.
+
+### Creating features for classification algorithm
+
+The features I am going to select are:
++ mean of power phase 1, 2, 3
++ SAD (sum of absolute differences) of power phase 1,2,3 
+computed over 15 minute intervals. The logic behind of this choice is the following: a high mean power consumption is indicative of occupancy, while a high SAD is indicative of appliances being switched on and off, which is itself an indicator of occupancy. By returning the absolute difference
+between adjacent power measurements, the SAD is a measure of variability just like the standard deviation, except that it does not depend on the mean consumption as the standard deviation does.
+
+
+```{r message=FALSE, warning=FALSE, results='hide'}
+h1p1_mean<- rollapply(h1p1Day, na.rm = TRUE, hasNA = TRUE, width = 900, by= 900,
+                         by.column = TRUE, FUN = mean)
+as.data.frame(h1p1_mean)
+h1p2_mean<- rollapply(h1p2Day, na.rm = TRUE, hasNA = TRUE, width = 900, by= 900,
+                      by.column = TRUE, FUN = mean)
+h1p3_mean<- rollapply(h1p3Day, na.rm = TRUE, hasNA = TRUE, width = 900, by= 900,
+                      by.column = TRUE, FUN = mean)
+h1p1_SAD<- rollapply(h1p1Day, na.rm = TRUE, hasNA = TRUE, width = 900, by= 900,
+                    by.column = TRUE, FUN = SAD)
+h1p2_SAD<- rollapply(h1p2Day, na.rm = TRUE, hasNA = TRUE, width = 900, by= 900,
+                    by.column = TRUE, FUN = SAD)
+h1p3_SAD<- rollapply(h1p3Day, na.rm = TRUE, hasNA = TRUE, width = 900, by= 900,
+                    by.column = TRUE, FUN = SAD)
+```
+
+## Creating a long data set
+
+Adding a column for the seconds (referring to the center points of the 15-min intervals):
+```{r message=FALSE, warning=FALSE, results='hide'}
+seconds<-seq(from=450, to = 57600-450, by = 900)
+h1p1_mean <- cbind(seconds, h1p1_mean)
+```
+
+Using gather to create a dataset where every row corresponds to a specific day and time:
+```{r message=FALSE, warning=FALSE, results='hide'}
+h1p1_meang <- gather(as.data.frame(h1p1_mean), key = day, value = p1m,-1)
+h1p2_meang <- gather(as.data.frame(h1p2_mean), key = day, value = p2m)
+h1p3_meang <- gather(as.data.frame(h1p3_mean), key = day, value = p3m)
+h1p1_SADg <- gather(as.data.frame(h1p1_SAD), key = day, value = p1SAD)
+h1p2_SADg <- gather(as.data.frame(h1p2_SAD), key = day, value = p2SAD)
+h1p3_SADg <- gather(as.data.frame(h1p3_SAD), key = day, value = p3SAD)
+```
+
+```{r message=FALSE, warning=FALSE, results='markup'}
+head(h1p1_meang)
+```
+Combining features into a dataframe:
+```{r message=FALSE, warning=FALSE, results='hide'}
+features <- cbind(h1p1_meang, h1p2_meang$p2m, h1p3_meang$p3m,
+                  h1p1_SADg$p1SAD, h1p2_SADg$p2SAD, h1p3_SADg$p3SAD)
+```
+
+Now I am going to create my label vector by computing the mean occupancy state of the household over 15 minute intervals and create a long dataset:
+```{r message=FALSE, warning=FALSE, results='hide'}
+h1occ_mean<- rollapply(as.data.frame(h1occDay_tr), na.rm = TRUE, hasNA = FALSE, width = 900, by= 900,
+                      by.column = TRUE, FUN = mean)
+h1occg <- gather(as.data.frame(h1occ_mean), key = day, value = y)
+```
+Some values are between 0 and 1. I am going to assume absence if the mean occupancy state is less than 0.5.
+```{r message=FALSE, warning=FALSE, results='hide'}
+h1occg$y <- round(h1occg$y)
+```
+
+The occupancy vector y can now be attached to the features data frame. I do so to ensure that the occupancy entries corresponding to the NA's in the power data frame are deleted as well.
+```{r message=FALSE, warning=FALSE, results='hide'}
+features$y <- h1occg$y
+```
+
+```{r message=FALSE, warning=FALSE}
+anyNA(features)
+features<-features[complete.cases(features), ]
+```
+Merging day and time column into a datetime object:
+```{r message=FALSE, warning=FALSE, results = 'hide'}
+features$datetime <- ymd(features$day) + seconds(features$seconds)
+```
+Changing order of columns:
+```{r message=FALSE, warning=FALSE, }
+features <- features[,c(1,2,10,3,4,5,6,7,8,9)]
+head(features)
+```
+
+One last step before using the k-nearest-neighbor classifier: normalizing the features.
+```{r message=FALSE, warning=FALSE, results = 'hide'}
+normalize <- function(x) {
+  return ((x - min(x)) / (max(x) - min(x)))
+}
+
+feat_norm <- cbind(features[,1:3], apply(features[,4:9], 2, normalize), features[,10])
+colnames(feat_norm) <- c("sec", "day", "datetime", "m_p1", "m_p2", "m_p3", "SAD_p1",
+                         "SAD_p2", "SAD_p3", "y")
+                         
+```
+                         
+
+
+### Data set analysis
+
+
+## Exploratory analysis
+
+How is the total electricity consumption (sum of three power phases) distributed across the day? I am going to create two timelines, one for periods of absence, and one for period of occupancy.
+
+
+```{r message=FALSE, warning=FALSE}
+AverageDay0 <- aggregate(features[which(features$y==0),4:6], by = list(features[which(features$y==0),]$seconds), FUN = mean)
+AverageDay0$total <- rowSums(AverageDay0[,2:4])
+AverageDay0$hour <- AverageDay0$Group.1/3600 + 6 
+AverageDay0$y <-0
+
+AverageDay1 <- aggregate(features[which(features$y==1),4:6], by = list(features[which(features$y==1),]$seconds), FUN = mean)
+AverageDay1$total <- rowSums(AverageDay1[,2:4])
+AverageDay1$hour <- AverageDay1$Group.1/3600 + 6
+AverageDay1$y <-1
+
+Combined <- rbind(AverageDay0,AverageDay1)
+
+library(ggplot2)
+PlotTheme <- theme(plot.background = 
+           element_rect(fill = "White", color="black", size = 2),
+           rect = element_blank(),
+           plot.title = element_text(hjust = 0.5, 
+                                     margin = margin(t = 20, r = 0, b = 20, l = 0)),
+           axis.line = element_line(color = "black", size = 0.8, linetype = "solid"),
+           axis.ticks = element_line(color = "black"),
+           axis.title.x = element_text(margin = margin(t = 10, r = 0, b = 20, l = 0),
+                                       size = rel(0.8)),
+           axis.title.y = element_text(margin = margin(t = 0, r = 10, b = 0, l = 20),
+                                       size = rel(0.8)))
+
+ggplot(Combined) + geom_line(aes(x=hour, y = total, color = as.factor(y)))+ 
+   ggtitle("Daily power consumption (15 minute averages), by time of the day" ) + 
+  xlab("Time") + 
+  scale_x_continuous(name = "Time (hours)", breaks = c(6, 10, 14, 18, 22)) +
+  scale_y_continuous(name = "Power consumption in W") +
+  scale_linetype_manual(name = " ", values= 1)+
+  scale_color_manual(values= c("#E69F00","#009E73" ), 
+                     guide = guide_legend(title="Occupancy state")) + PlotTheme
+```
+
+Plotting a histogram:
+```{r message=FALSE, warning=FALSE}
+TotalDailyConsumption0 <- aggregate(features[which(features$y==0),4:6], by = list(features[which(features$y==0),]$day), FUN = mean)
+TotalDailyConsumption0$total <- rowSums(TotalDailyConsumption0[,2:4])
+TotalDailyConsumption0$y <-0
+
+TotalDailyConsumption1 <- aggregate(features[which(features$y==1),4:6], by = list(features[which(features$y==1),]$day), FUN = mean)
+TotalDailyConsumption1$total <- rowSums(TotalDailyConsumption1[,2:4])
+TotalDailyConsumption1$y <-1
+
+CombinedDailyCons <- rbind(TotalDailyConsumption0,TotalDailyConsumption1)
+
+ggplot(CombinedDailyCons, aes(x=total, fill = as.factor(y))) +
+  scale_x_log10(limits=c(10,10000), breaks=c(10,100,1000,10000)) +
+  ggtitle("Histogram of daily power consumption (15 minute averages), by occupancy state" )+
+  xlab("Average daily power consumption in W")+
+  scale_fill_manual(values= c("#E69F00","#009E73" )) +
+  geom_histogram(alpha = .3) +
+facet_wrap(~y) + PlotTheme
+
+```
+
+The graph shows that during periods of absence, the power consumption is lower than the power consumption at the same time of the day during periods of presence, and exhibits less variation (smaller fluctuations) throughout the day. This gives a validation that the chosen features are a sensible choice to distinguish between occupancy states.
+
+## k nearest neighbor classifier
+
+First, I am going to split dataset into validation/training:
+
+```{r message=FALSE, warning=FALSE, results = 'hide'}
+set.seed(3649)
+trainIndex <- createDataPartition(feat_norm$y, p = .8, 
+                                  list = FALSE, 
+                                  times = 1)
+Train <- feat_norm[trainIndex,]
+Test  <- feat_norm[-trainIndex,]
+```
+
+
+Creating labels vector and feeding it into the knn function:
+```{r message=FALSE, warning=FALSE,results = 'hide'}
+labels <- Train$y
+occ_pred <- knn(train = Train[, 4:9], test = Test[, 4:9], cl = labels)
+```
+Confusion matrix:
+```{r message=FALSE, warning=FALSE,results = 'hide'}
+occ_actual <- Test$y
+table(occ_pred, occ_actual)
+```
+Computing accuracy:
+```{r message=FALSE, warning=FALSE,results = 'hide'}
+mean(occ_pred==occ_actual)
+```
+
+## Trying different values for k
+
+As a default, the knn function uses a default value of 1. This increases the risk of overfitting, since it allows for more subtle patterns. It is recommended to try different values of k and compare their performances, e.g. using k = 5, k = 10 and k= 20.
+
+```{r message=FALSE, warning=FALSE,results = 'markup'}
+k_5 <- knn(Train[, 4:9], test = Test[, 4:9], cl = labels, k = 5)
+mean(k_5 == occ_actual)
+k_10 <-  knn(Train[, 4:9], test = Test[, 4:9], cl = labels, k = 10)
+mean(k_10 == occ_actual)
+k_20 <- knn(Train[, 4:9], test = Test[, 4:9], cl = labels, k = 20)
+mean(k_20 == occ_actual)
+```
+
+Indeed, the prediction performance increased slightly by using higher k’s than 1.
+
+
+## Conclusions
+
+The classification algorithm achieved a precision of 81 percent, in line with the results obtained by Kleiminger et al. (2013). However, the result was achieved using fewer classification features compared to the algorithm proposed by the authors (who also took into consideration the standard deviation over 15-minute intervals). Using only six features reduced the calculation time considerably.
+The analysis could be expanded by taking into consideration night power consumption patterns, and differentiating between seasons. Furthermore, different algorithms could be tried, such as support vector machines.
+
+
